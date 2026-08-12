@@ -1,0 +1,1881 @@
+---
+title: "FAIR_CLUSTERING"
+author: "ABHISHEK"
+date: "2026-08-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# ============================================================================
+# THREE CATEGORICAL CLUSTERING METHODS 
+#
+#   Method 1: fit_multicluster()   -- reconstructed replication of the
+#             original Santos & Heras (2020) Multicluster algorithm
+#             # (coincidence matrix + Fleiss' Kappa tie-break; NO fairness
+#             term). Kept only as a lower-bound sanity check -- see note
+#             below on why it is NOT the right baseline for a paper.
+#   Method 2: fit_tv_cluster()     -- the paper's OWN fairness objective
+#             (Santos-Mangudo & Heras 2022, Fair-Multicluster): a swap-based
+#             search that minimizes similarity loss plus
+#             lambda_tv * F_marginal, where F_marginal is the size-weighted
+#             TV distance between a cluster's per-PROTECTED-VARIABLE ratio
+#             and the population ratio, averaged over protected variables.
+#             ** UPDATE: this now genuinely uses MARGINAL (per-variable)
+#             tables. The previous version computed the TV objective on the
+#             JOINT protected-category table, which is not the same
+#             quantity and made "TV" and "CA" harder to compare cleanly.
+#             This is the correct baseline: it is ALSO trying to be fair,
+#             using the paper's actual criterion.
+#   Method 3: fit_ca_cluster()     -- our method. ** UPDATE: now a NESTED
+#             two-lambda objective, not CA-only:
+#
+#                 L_CA = L_sim + lambda_tv * F_marginal + lambda_ca * F_intersectional
+#
+#             F_marginal is the SAME per-protected-variable TV term used by
+#             fit_tv_cluster(). F_intersectional is Phi^2 = chi-sq/n on the
+#             JOINT protected-category contingency table. Setting
+#             lambda_ca = 0 recovers exactly the TV-fair method; setting
+#             lambda_tv = 0 recovers the old CA-only method. This makes the
+#             conceptual progression explicit:
+#
+#                 similarity -> + marginal fairness -> + intersectional fairness
+#
+# Methods 2 and 3 are two thin wrappers around ONE shared, generic search
+# engine (fit_fair_cluster()) that now takes (lambda_tv, lambda_ca) instead
+# of a single lambda + criterion switch. This matters for the comparison to
+# be meaningful: TV-fair vs CA-fair isolates "does adding the intersectional
+# term help", not "does the search procedure happen to differ".
+#
+# BUG FIX (read this first): the previous version of this file could
+# crash with "subscript out of bounds" at high lambda, noted in its own
+# comments as unresolved. Root cause, confirmed by direct reproduction
+# (see chat): when a cluster becomes completely empty (its last member
+# multicluster moves out), update_representative() returns NULL, and the
+# old code did `representative[[a]] <- NULL`. In R this does NOT set that
+# list slot to empty -- it DELETES the element and shifts every later
+# element down one index, silently corrupting every representative[[c]]
+# for c > a from that point on, until an out-of-range index is eventually
+# hit. Fixed two ways, belt-and-braces:
+#   (1) STRUCTURAL fix: a multicluster is never allowed to be the move
+#       that empties its current cluster (see the `sum(assignment==a)<=1`
+#       guard in the search loop below) -- exactly k non-empty clusters
+#       are guaranteed at all times, matching what Fair-Multicluster's
+#       Step 3 always assumes.
+#   (2) DEFENSIVE fix: representative-list updates are now guarded with
+#       `if (!is.null(new_rep))` everywhere, so even if a NULL ever did
+#       come back, it would leave the old representative in place instead
+#       of corrupting the list -- belt AND braces.
+# With both fixes in place, lambda was swept up to 200 (10x past the old
+# "unsafe" ceiling of 20) with no crash and no degenerate (collapsed)
+# clusters -- see the verification run at the bottom of this file.
+# ============================================================================
+
+
+## ============================================================================
+## PART 0: shared low-level helpers
+## ============================================================================
+# 
+# # CREATING A DATASET TO KEEP CHECKING CODE ACTIVELY:
+set.seed(123)
+ n <- 100
+ ## Protected variables
+ Gender   <- rep(c("Male","Female"), each = 50)
+Religion <- rep(rep(c("Hindu","Christian"), each = 25), 2)
+ data <- data.frame(Gender, Religion)
+ data$Profile <- interaction(data$Gender,
+                             data$Religion,
+                            sep = "_")
+data$Profile
+table(data$Profile)
+
+
+Cluster <- rep(NA,n)
+for(i in 1:n){
+  p <- data$Profile[i]
+  if(p=="Male_Hindu"){
+    Cluster[i] <- sample(c(1,2),1,
+                         prob=c(0.5,0.5))
+  }
+  if(p=="Male_Christian"){
+    Cluster[i] <- sample(c(1,2),1,
+                         prob=c(0.5,0.5))
+  }
+  if(p=="Female_Hindu"){
+    Cluster[i] <- sample(c(1,2),1,
+                         prob=c(0.1,0.9))
+  }
+  if(p=="Female_Christian"){
+    Cluster[i] <- sample(c(1,2),1,
+                         prob=c(0.7,0.3))
+  }
+}
+
+data$TrueCluster <- factor(Cluster)
+
+data$TrueCluster
+
+Y1 <- Y2 <- Y3 <- character(n)
+for(i in 1:n){
+  if(data$TrueCluster[i] == 1){
+    Y1[i] <- sample(c("A","B"), 1, prob = c(0.85,0.15))
+    Y2[i] <- sample(c("Yes","No"), 1, prob = c(0.80,0.20))
+    Y3[i] <- sample(c("High","Low"), 1, prob = c(0.90,0.10))
+  } else {
+    Y1[i] <- sample(c("A","B"), 1, prob = c(0.15,0.85))
+    Y2[i] <- sample(c("Yes","No"), 1, prob = c(0.20,0.80))
+    Y3[i] <- sample(c("High","Low"), 1, prob = c(0.10,0.90))
+  }
+}
+data$Y1 <- Y1
+data$Y2 <- Y2
+data$Y3 <- Y3
+data
+
+
+cluster_vars<-c("Y1","Y2","Y3")
+
+build_multiclusters_fast <- function(data, cluster_vars) {
+  key <- do.call(paste, c(data[cluster_vars], sep = "\u0001"))
+  idx_split <- split(seq_len(nrow(data)), key)
+  mc_list <- lapply(names(idx_split), function(k) {
+    idx <- idx_split[[k]]
+    list(profile = data[idx[1], cluster_vars, drop = FALSE],
+         indices = idx, size = length(idx))
+  })
+  mc_list[order(-vapply(mc_list, function(m) m$size, numeric(1)))]
+}
+build_multiclusters_fast(data,cluster_vars)
+
+
+
+similarity_score <- function(profile, representative, cluster_vars) {
+  if (is.null(representative)) return(0)
+  match_count <- 0
+  for (v in cluster_vars) {
+    if (as.character(profile[[v]]) == as.character(representative[[v]])) {
+      match_count <- match_count + 1
+    }
+  }
+  match_count / length(cluster_vars)
+}
+
+weighted_mode <- function(values, weights) {
+  totals <- tapply(weights, values, sum)
+  names(totals)[which.max(totals)]
+}
+
+update_representative <- function(data, cluster_vars, multiclusters, member_ids) {
+  if (length(member_ids) == 0) return(NULL)   # empty cluster -> caller MUST guard this (see fix above)
+  rep_row <- list()
+  for (v in cluster_vars) {
+    all_values  <- character(0)
+    all_weights <- numeric(0)
+    for (m in member_ids) {
+      all_values  <- c(all_values,  as.character(multiclusters[[m]]$profile[[v]]))
+      all_weights <- c(all_weights, multiclusters[[m]]$size)
+    }
+    rep_row[[v]] <- weighted_mode(all_values, all_weights)
+  }
+  as.data.frame(rep_row, stringsAsFactors = FALSE)
+}
+
+safe_set_representative <- function(representative, c_id, new_rep) {
+  if (!is.null(new_rep)) representative[[c_id]] <- new_rep
+  representative
+}
+
+# # if we do this r drops B !!
+# x <- list("A","B","C")
+# x[[2]] <- NULL
+# x
+
+
+## ============================================================================
+## PART 2: METHOD 1 -- fit_multicluster() (no fairness term)
+##
+## IMPORTANT: this is the 2020 base algorithm, not Fair-Multicluster (2022).
+## It has no protected_vars, no lambda, no fairness objective at all -- it
+## is only a lower-bound sanity check ("what happens if fairness is
+## completely ignored"), NOT the competitor your CA method needs to beat.
+## fit_tv_cluster() below is the real baseline. Keep both in every
+## simulation: Multicluster tells you the size of the problem,
+## TV-vs-CA tells you whether your method is actually better.
+## ============================================================================
+
+coincidence_count <- function(profile_a, profile_b, cluster_vars) {
+  sum(vapply(cluster_vars, function(v)
+    as.character(profile_a[[v]]) == as.character(profile_b[[v]]), logical(1)))
+}
+
+coincidence_against_all <- function(profile, representative_list, cluster_vars) {
+  vapply(representative_list, function(rep) coincidence_count(profile, rep, cluster_vars), numeric(1))
+}
+
+
+## NOT THERE IN PAPER BUT EXTRA ---
+
+
+# fleiss_kappa_pair <- function(profile_a, profile_b, cluster_vars, level_freq) {
+#   p <- length(cluster_vars)
+#   agree <- 0; chance <- 0
+#   for (v in cluster_vars) {
+#     a <- as.character(profile_a[[v]]); b <- as.character(profile_b[[v]])
+#     agree <- agree + as.numeric(a == b)
+#     chance <- chance + sum(level_freq[[v]]^2)
+#   }
+#   p_o <- agree / p; p_e <- chance / p
+#   if (p_e >= 1) return(0)
+#   (p_o - p_e) / (1 - p_e)
+# }
+
+# fit_multicluster <- function(data, cluster_vars, k) {
+#   mc <- build_multiclusters_fast(data, cluster_vars)
+#   L  <- length(mc)
+#   if (k > L) stop("k cannot exceed number of distinct multiclusters (", L, ")")
+#   
+#   level_freq <- list()
+#   for (v in cluster_vars) {
+#     vals <- vapply(mc, function(m) as.character(m$profile[[v]]), character(1))
+#     sizes <- vapply(mc, function(m) m$size, numeric(1))
+#     tab <- tapply(sizes, vals, sum)
+#     level_freq[[v]] <- tab / sum(tab)
+#   }
+#   
+#   cluster_members <- vector("list", k)
+#   cluster_rep      <- vector("list", k)
+#   for (c in 1:k) { cluster_members[[c]] <- c(c); cluster_rep[[c]] <- mc[[c]]$profile }
+#   
+#   if (L > k) {
+#     for (j in (k + 1):L) {
+#       coincidences <- coincidence_against_all(mc[[j]]$profile, cluster_rep, cluster_vars)
+#       best_val   <- max(coincidences)
+#       candidates <- which(coincidences == best_val)
+#       if (length(candidates) > 1) {
+#         kappas <- vapply(candidates, function(c)
+#           fleiss_kappa_pair(mc[[j]]$profile, cluster_rep[[c]], cluster_vars, level_freq), numeric(1))
+#         best_c <- candidates[which.max(kappas)]
+#       } else {
+#         best_c <- candidates[1]
+#       }
+#       cluster_members[[best_c]] <- c(cluster_members[[best_c]], j)
+#       cluster_rep[[best_c]] <- update_representative(data, cluster_vars, mc, cluster_members[[best_c]])
+#     }
+#   }
+#   
+#   assignment_mc <- integer(L)
+#   for (c in 1:k) assignment_mc[cluster_members[[c]]] <- c
+#   obs_cluster <- integer(nrow(data))
+#   for (j in 1:L) obs_cluster[mc[[j]]$indices] <- assignment_mc[j]
+#   
+#   list(k = k, assignment_mc = assignment_mc, assignment_obs = obs_cluster, multiclusters = mc)
+# }
+
+
+
+fit_multicluster <- function(data, cluster_vars, k) {
+  mc <- build_multiclusters_fast(data, cluster_vars)
+  L  <- length(mc)
+  if (k > L) stop("k cannot exceed number of distinct multiclusters (", L, ")")
+  
+  representative <- vector("list", k)
+  assignment <- integer(L)
+  for (c in 1:k) { representative[[c]] <- mc[[c]]$profile; assignment[c] <- c }
+  
+  if (L > k) {
+    for (j in (k + 1):L) {
+      sims <- vapply(1:k, function(c)
+        similarity_score(mc[[j]]$profile, representative[[c]], cluster_vars), numeric(1))
+      best_c <- which.max(sims)
+      assignment[j] <- best_c
+      new_rep <- update_representative(data, cluster_vars, mc, which(assignment == best_c))
+      representative <- safe_set_representative(representative, best_c, new_rep)
+    }
+  }
+  
+  obs_cluster <- integer(nrow(data))
+  for (j in 1:L) obs_cluster[mc[[j]]$indices] <- assignment[j]
+  
+  list(k = k, assignment_mc = assignment, assignment_obs = obs_cluster,
+       multiclusters = mc, representatives = representative)
+}
+
+## ============================================================================
+## PART 3: METHODS 2 & 3 -- fit_tv_cluster() and fit_ca_cluster(), sharing
+## one generic engine (fit_fair_cluster) that now takes TWO lambdas:
+##
+##   lambda_tv : weight on F_marginal   (per-protected-variable TV term)
+##   lambda_ca : weight on F_intersectional (Phi^2 on the JOINT table)
+##
+## fit_tv_cluster()  == fit_fair_cluster(..., lambda_tv = lambda, lambda_ca = 0)
+## fit_ca_cluster()  == fit_fair_cluster(..., lambda_tv = lambda_tv, lambda_ca = lambda_ca)
+##
+## i.e. fit_ca_cluster() with lambda_tv = 0 is the OLD CA-only method; with
+## lambda_tv > 0 it is the NEW nested objective from the design doc:
+##   L_CA = L_sim + lambda_tv * F_marginal + lambda_ca * F_intersectional
+## ============================================================================
+
+build_joint_protected_counts <- function(data, protected_vars, multiclusters) {
+  labels_all <- do.call(paste, c(data[protected_vars], sep = "\u0001"))
+  levels_all <- sort(unique(labels_all))
+  M <- length(levels_all)
+  V <- matrix(0, nrow = length(multiclusters), ncol = M)
+  for (l in seq_along(multiclusters)) {
+    idx <- multiclusters[[l]]$indices
+    V[l, ] <- as.numeric(table(factor(labels_all[idx], levels = levels_all)))
+  }
+  list(V = V, levels = levels_all, M = M)
+}
+
+# --- NEW: per-protected-variable ("marginal") counts, one table per var ---
+# Unlike build_joint_protected_counts() (rows = joint category combinations),
+# this builds one L x M_p count matrix PER protected variable p, so the
+# TV/marginal term can be computed on each variable separately and then
+# summed/averaged, matching the paper's actual "marginal fairness" notion
+# rather than TV-on-the-joint-table.
+build_single_protected_counts <- function(data, var, multiclusters) {
+  labels <- as.character(data[[var]])
+  levels_all <- sort(unique(labels))
+  M <- length(levels_all)
+  V <- matrix(0, nrow = length(multiclusters), ncol = M)
+  for (l in seq_along(multiclusters)) {
+    idx <- multiclusters[[l]]$indices
+    V[l, ] <- as.numeric(table(factor(labels[idx], levels = levels_all)))
+  }
+  list(V = V, levels = levels_all, M = M)
+}
+
+build_marginal_protected_counts <- function(data, protected_vars, multiclusters) {
+  setNames(
+    lapply(protected_vars, function(v) build_single_protected_counts(data, v, multiclusters)),
+    protected_vars
+  )
+}
+
+# --- The ONE formula that differs between the TV term and the CA term ----
+#
+# Both work off an M x k contingency table N (rows = category levels of
+# whichever table is passed in, columns = clusters) and a fixed row-marginal
+# vector r (population proportions for those levels, never changes during
+# search). They differ only in how a column's "unfairness contribution" is
+# scored:
+#
+#   criterion = "ca": chi-square term (N-E)^2/E, summed over rows. This is
+#       Phi^2 in "count units"; dividing the total by n gives Phi^2 exactly
+#       (see MATH.md for the CCA/correspondence-analysis derivation). Used
+#       ONLY on the joint protected-category table (F_intersectional).
+#   criterion = "tv": 0.5*sum_g|N_g - E_g|, summed over rows. This is
+#       n_c * TV_c in "count units" -- the paper's OWN Fair-Multicluster
+#       Step-3 criterion (Euclidean/TV distance between a cluster's
+#       protected-attribute ratio and the desired/population ratio), run
+#       inside a swap search instead of a transmitter/receiver merge. Used
+#       on EACH protected variable's own marginal table (F_marginal), then
+#       summed across variables.
+#
+# E (the "expected count under independence/no-bias" column) is always
+# r * column_total, well-defined and non-zero everywhere BECAUSE the
+# empty-cluster bug fix (Part 0/below) guarantees no cluster ever has
+# column_total == 0.
+contrib_column <- function(col, r, total, criterion) {
+  E <- r * total
+  if (criterion == "ca") sum((col - E)^2 / E) else 0.5 * sum(abs(col - E))
+}
+
+# --- Combine the marginal (TV, per protected var) and intersectional (CA,
+# joint table) contributions for ONE cluster column into a single weighted
+# unfairness number. lambda_ca = 0 recovers TV-only; both > 0 gives the
+# nested CA objective.
+combined_contrib_vec <- function(Np_vec_list, rp_list, Nj_vec, rj, lambda_tv, lambda_ca) {
+  marg <- 0
+  if (lambda_tv != 0) {
+    for (p in names(Np_vec_list)) {
+      col <- Np_vec_list[[p]]
+      marg <- marg + contrib_column(col, rp_list[[p]], sum(col), "tv")
+    }
+  }
+  joint <- 0
+  if (lambda_ca != 0) {
+    joint <- contrib_column(Nj_vec, rj, sum(Nj_vec), "ca")
+  }
+  lambda_tv * marg + lambda_ca * joint
+}
+
+## ============================================================================
+## 
+## This version removes that dependency entirely: at every iteration, it
+## computes the best destination AND best gain for EVERY multicluster
+## still eligible to move, then executes ONLY the single globally-best move
+## across the whole data set, recomputes state, and repeats. The order
+## multiclusters happen to be stored in no longer affects which move
+## happens first -- the move that happens first is, by construction,
+## whichever one improves the objective the most.
+##
+## Cost: each outer iteration costs O(L*k) fairness-contribution
+## evaluations (one per multicluster x candidate cluster, excluding the
+## multicluster's own current cluster) -- the same per-evaluation cost as
+## before, since each is still the O(1)-state-update / O(1)-contrib-
+## recompute from the incremental Phi^2 / TV bookkeeping (now done for the
+## marginal tables AND the joint table together). The difference is that
+## only ONE move is committed per iteration instead of up to L moves per
+## sweep, so this does strictly more gain evaluations for the same number
+## of committed moves -- the price paid for removing order-dependence and
+## guaranteeing each committed move is the best one available given
+## everything committed so far.
+## ============================================================================
+
+fit_fair_cluster <- function(data, cluster_vars, protected_vars, k,
+                              lambda_tv = 1, lambda_ca = 0,
+                              max_iters = NULL, verbose = FALSE, report_every = 50) {
+
+  mc <- build_multiclusters_fast(data, cluster_vars)
+  L  <- length(mc)
+  if (k > L) stop("k cannot exceed number of distinct multiclusters (", L, ")")
+  if (is.null(max_iters)) max_iters <- 50L * L   # generous safety cap, see note below
+
+  # --- joint (intersectional) table -- feeds the CA / Phi^2 term ----------
+  jp <- build_joint_protected_counts(data, protected_vars, mc)
+  Vj <- jp$V; Mj <- jp$M
+  rj <- colSums(Vj) / sum(Vj)
+
+  # --- one marginal table PER protected variable -- feeds the TV term -----
+  mp_list <- build_marginal_protected_counts(data, protected_vars, mc)
+  Vp_list <- lapply(mp_list, `[[`, "V")
+  rp_list <- lapply(Vp_list, function(V) colSums(V) / sum(V))
+
+  n_total <- sum(Vj)   # = nrow(data); same denominator for every term
+
+  representative <- vector("list", k)
+  assignment <- integer(L)
+  for (c in 1:k) { representative[[c]] <- mc[[c]]$profile; assignment[c] <- c }
+
+  if (L > k) {
+    for (j in (k + 1):L) {
+      sims <- vapply(1:k, function(c)
+        similarity_score(mc[[j]]$profile, representative[[c]], cluster_vars), numeric(1))
+      best_c <- which.max(sims)
+      assignment[j] <- best_c
+      new_rep <- update_representative(data, cluster_vars, mc, which(assignment == best_c))
+      representative <- safe_set_representative(representative, best_c, new_rep)
+    }
+  }
+
+  # Per-cluster contingency tables: one joint (Mj x k), one per protected
+  # variable (Mp x k each).
+  Nj <- matrix(0, nrow = Mj, ncol = k)
+  Np_list <- lapply(Vp_list, function(V) matrix(0, nrow = ncol(V), ncol = k))
+  for (c in 1:k) {
+    members <- which(assignment == c)
+    if (length(members) > 0) {
+      Nj[, c] <- colSums(Vj[members, , drop = FALSE])
+      for (p in names(Vp_list)) Np_list[[p]][, c] <- colSums(Vp_list[[p]][members, , drop = FALSE])
+    }
+  }
+
+  col_contrib <- vapply(1:k, function(c) {
+    Np_vec_list <- lapply(Np_list, function(N) N[, c])
+    combined_contrib_vec(Np_vec_list, rp_list, Nj[, c], rj, lambda_tv, lambda_ca)
+  }, numeric(1))
+  fair_val <- sum(col_contrib) / n_total
+
+  # --- Helper: best destination + gain for ONE multicluster l, given the
+  # CURRENT state (Nj, Np_list, col_contrib, fair_val). Same math as before,
+  # just factored out so the outer loop can call it for every l each
+  # iteration, and generalized over the marginal tables + joint table. ---
+  best_move_for <- function(l) {
+    a <- assignment[l]
+    # never allow l to be the move that empties cluster a (bug-fix (1),
+    # unchanged from the sequential version)
+    if (sum(assignment == a) <= 1) return(list(gain = -Inf, b = a))
+
+    sim_a <- similarity_score(mc[[l]]$profile, representative[[a]], cluster_vars)
+    best_gain <- 0; best_b <- a
+    for (b in 1:k) {
+      if (b == a) next
+      sim_b <- similarity_score(mc[[l]]$profile, representative[[b]], cluster_vars)
+      d_sim <- sim_b - sim_a
+
+      Nj_a_new <- Nj[, a] - Vj[l, ]
+      Nj_b_new <- Nj[, b] + Vj[l, ]
+      Np_a_new <- setNames(lapply(names(Vp_list), function(p) Np_list[[p]][, a] - Vp_list[[p]][l, ]), names(Vp_list))
+      Np_b_new <- setNames(lapply(names(Vp_list), function(p) Np_list[[p]][, b] + Vp_list[[p]][l, ]), names(Vp_list))
+
+      contrib_a_new <- combined_contrib_vec(Np_a_new, rp_list, Nj_a_new, rj, lambda_tv, lambda_ca)
+      contrib_b_new <- combined_contrib_vec(Np_b_new, rp_list, Nj_b_new, rj, lambda_tv, lambda_ca)
+
+      new_fair <- (fair_val * n_total - col_contrib[a] - col_contrib[b] +
+                     contrib_a_new + contrib_b_new) / n_total
+      # lambda_tv / lambda_ca are already baked into col_contrib / fair_val,
+      # so the gain is simply similarity gain minus the (already-weighted)
+      # change in combined unfairness -- no extra outer lambda multiply.
+      gain <- d_sim - (new_fair - fair_val)
+      if (gain > best_gain + 1e-9) { best_gain <- gain; best_b <- b }
+    }
+    list(gain = if (best_b == a) -Inf else best_gain, b = best_b)
+  }
+
+  # --- Outer loop: ONE globally-best move committed per iteration ---
+  n_moves <- 0L
+  for (iter in seq_len(max_iters)) {
+
+    # Evaluate every multicluster's best move this round. This is the
+    # O(L*k) pass Option 4 requires -- no shortcuts taken, every candidate
+    # re-evaluated against the CURRENT state so nothing here is stale.
+    moves <- vector("list", L)
+    for (l in 1:L) moves[[l]] <- best_move_for(l)
+    gains <- vapply(moves, function(m) m$gain, numeric(1))
+
+    best_l <- which.max(gains)
+    best_gain <- gains[best_l]
+    if (!is.finite(best_gain) || best_gain <= 1e-9) break   # no improving move anywhere -- done
+
+    # --- execute the single best move ---
+    a <- assignment[best_l]; b <- moves[[best_l]]$b
+    Nj[, a] <- Nj[, a] - Vj[best_l, ]
+    Nj[, b] <- Nj[, b] + Vj[best_l, ]
+    for (p in names(Vp_list)) {
+      Np_list[[p]][, a] <- Np_list[[p]][, a] - Vp_list[[p]][best_l, ]
+      Np_list[[p]][, b] <- Np_list[[p]][, b] + Vp_list[[p]][best_l, ]
+    }
+    for (cc in c(a, b)) {
+      Np_vec_list <- lapply(Np_list, function(N) N[, cc])
+      col_contrib[cc] <- combined_contrib_vec(Np_vec_list, rp_list, Nj[, cc], rj, lambda_tv, lambda_ca)
+    }
+    fair_val <- sum(col_contrib) / n_total
+    assignment[best_l] <- b
+
+    # bug-fix (2), unchanged: never let a possible NULL delete a list slot
+    new_rep_a <- update_representative(data, cluster_vars, mc, which(assignment == a))
+    new_rep_b <- update_representative(data, cluster_vars, mc, which(assignment == b))
+    representative <- safe_set_representative(representative, a, new_rep_a)
+    representative <- safe_set_representative(representative, b, new_rep_b)
+    n_moves <- n_moves + 1L
+
+    if (verbose && (n_moves %% report_every == 0)) {
+      cat(sprintf("[lambda_tv=%.3g, lambda_ca=%.3g] move %d | MC%d: cluster %d -> %d | gain=%.5f | fair=%.5f\n",
+                   lambda_tv, lambda_ca, n_moves, best_l, a, b, best_gain, fair_val))
+    }
+  }
+  if (verbose) cat(sprintf("[lambda_tv=%.3g, lambda_ca=%.3g] converged after %d moves (%d outer iterations)\n",
+                            lambda_tv, lambda_ca, n_moves, iter))
+
+  obs_cluster <- integer(nrow(data))
+  for (l in 1:L) obs_cluster[mc[[l]]$indices] <- assignment[l]
+
+  # Report the two fairness components SEPARATELY as well as combined, so a
+  # fit can always be inspected for "how much marginal vs intersectional
+  # unfairness is left", regardless of which lambdas were used to get there.
+  marginal_val <- sum(vapply(1:k, function(c) {
+    sum(vapply(names(Np_list), function(p)
+      contrib_column(Np_list[[p]][, c], rp_list[[p]], sum(Np_list[[p]][, c]), "tv"), numeric(1)))
+  }, numeric(1))) / n_total
+
+  joint_val <- sum(vapply(1:k, function(c)
+    contrib_column(Nj[, c], rj, sum(Nj[, c]), "ca"), numeric(1))) / n_total
+
+  list(k = k, lambda_tv = lambda_tv, lambda_ca = lambda_ca,
+       assignment_mc = assignment, assignment_obs = obs_cluster,
+       multiclusters = mc, representatives = representative,
+       fair_val = fair_val,             # lambda_tv*marginal + lambda_ca*joint, combined
+       marginal_val = marginal_val,     # F_marginal alone (unweighted)
+       joint_val = joint_val,           # F_intersectional alone (unweighted), = Phi^2
+       phi2 = joint_val,                # kept for backward-compat naming
+       contingency_table = Nj, marginal_tables = Np_list,
+       protected_levels = jp$levels, n_moves = n_moves)
+}
+
+#' Method 3 (ours): nested CA objective.
+#'   L_CA = L_sim + lambda_tv * F_marginal + lambda_ca * F_intersectional
+#' lambda_tv = 0 recovers the OLD CA-only (intersectional-only) method;
+#' lambda_ca = 0 recovers the TV-fair method exactly.
+fit_ca_cluster <- function(data, cluster_vars, protected_vars, k,
+                            lambda_tv = 1, lambda_ca = 1,
+                            verbose = FALSE, max_iters = NULL) {
+  fit_fair_cluster(data, cluster_vars, protected_vars, k,
+                    lambda_tv = lambda_tv, lambda_ca = lambda_ca,
+                    max_iters = max_iters, verbose = verbose)
+}
+
+#' Method 2 (the correct baseline): the paper's OWN Fair-Multicluster
+#' fairness objective -- MARGINAL-only (per protected variable, averaged)
+#' TV penalty, run through the identical steepest-descent search as
+#' fit_ca_cluster(). Equivalent to fit_ca_cluster(lambda_tv = lambda, lambda_ca = 0).
+fit_tv_cluster <- function(data, cluster_vars, protected_vars, k,
+                            lambda = 1, verbose = FALSE, max_iters = NULL) {
+  fit_fair_cluster(data, cluster_vars, protected_vars, k,
+                    lambda_tv = lambda, lambda_ca = 0,
+                    max_iters = max_iters, verbose = verbose)
+}
+
+## ============================================================================
+## PART 4: shared evaluation helpers -- score ANY assignment (from any of
+## the three methods) on a common set of statistics, so comparisons are
+## always apples-to-apples regardless of which method produced them.
+## ============================================================================
+
+phi2_from_table <- function(N, r) {
+  n <- sum(N)
+  col_totals <- colSums(N)
+  E <- outer(r, col_totals)
+  col_contrib <- colSums((N - E)^2 / E, na.rm = TRUE)
+  sum(col_contrib) / n
+}
+
+tv_from_table <- function(N, r) {
+  n <- sum(N)
+  col_totals <- colSums(N)
+  E <- outer(r, col_totals)
+  col_contrib <- 0.5 * colSums(abs(N - E))
+  sum(col_contrib) / n
+}
+
+evaluate_phi2 <- function(assignment_mc, protected_vars, data, multiclusters, k) {
+  jp <- build_joint_protected_counts(data, protected_vars, multiclusters)
+  r  <- colSums(jp$V) / sum(jp$V)
+  N  <- matrix(0, nrow = jp$M, ncol = k)
+  for (c in 1:k) {
+    members <- which(assignment_mc == c)
+    if (length(members) > 0) N[, c] <- colSums(jp$V[members, , drop = FALSE])
+  }
+  phi2_from_table(N, r)
+}
+
+#' TV distance computed on the JOINT protected-category table. Kept for
+#' reference / comparability with the old single-lambda version of this
+#' file -- NOT the same quantity as F_marginal (see evaluate_marginal_tv()).
+evaluate_tv <- function(assignment_mc, protected_vars, data, multiclusters, k) {
+  jp <- build_joint_protected_counts(data, protected_vars, multiclusters)
+  r  <- colSums(jp$V) / sum(jp$V)
+  N  <- matrix(0, nrow = jp$M, ncol = k)
+  for (c in 1:k) {
+    members <- which(assignment_mc == c)
+    if (length(members) > 0) N[, c] <- colSums(jp$V[members, , drop = FALSE])
+  }
+  tv_from_table(N, r)
+}
+
+#' TRUE marginal fairness metric (matches F_marginal inside the fitting
+#' objective): average, across protected variables, of the size-weighted TV
+#' distance between a cluster's per-variable marginal distribution and the
+#' population's marginal distribution for that variable.
+evaluate_marginal_tv <- function(assignment_mc, protected_vars, data, multiclusters, k) {
+  mp_list <- build_marginal_protected_counts(data, protected_vars, multiclusters)
+  per_var <- vapply(protected_vars, function(p) {
+    Vp <- mp_list[[p]]$V
+    rp <- colSums(Vp) / sum(Vp)
+    Np <- matrix(0, nrow = ncol(Vp), ncol = k)
+    for (c in 1:k) {
+      members <- which(assignment_mc == c)
+      if (length(members) > 0) Np[, c] <- colSums(Vp[members, , drop = FALSE])
+    }
+    tv_from_table(Np, rp)
+  }, numeric(1))
+  mean(per_var)
+}
+
+#' Deviation statistics (avg/max/min/RMSE), generalized to work over the
+#' JOINT protected category (any number of protected attributes), matching
+
+evaluate_deviation_stats <- function(assignment_mc, protected_vars, data, multiclusters, k) {
+  jp <- build_joint_protected_counts(data, protected_vars, multiclusters)
+  r  <- colSums(jp$V) / sum(jp$V)
+  N  <- matrix(0, nrow = jp$M, ncol = k)
+  for (c in 1:k) {
+    members <- which(assignment_mc == c)
+    if (length(members) > 0) N[, c] <- colSums(jp$V[members, , drop = FALSE])
+  }
+  col_totals <- colSums(N)
+  P <- sweep(N, 2, col_totals, "/")            # M x k, per-cluster proportions
+  Dc <- colSums(abs(P - r))                     # length k
+  rmse_c <- colSums((P - r)^2)
+  list(avg_deviation = mean(Dc), max_deviation = max(Dc), min_deviation = min(Dc),
+       rmse = sqrt(mean(rmse_c)))
+}
+
+
+#' Size-weighted average matching coefficient (clustering-quality metric).
+
+evaluate_similarity <- function(multiclusters, cluster_vars, assignment_mc, representative) {
+  total_w <- 0; total_sim <- 0
+  for (l in seq_along(multiclusters)) {
+    c_id <- assignment_mc[l]
+    rep <- representative[[c_id]]
+    if (is.null(rep)) next
+    sim <- similarity_score(multiclusters[[l]]$profile, rep, cluster_vars)
+    total_sim <- total_sim + sim * multiclusters[[l]]$size
+    total_w   <- total_w + multiclusters[[l]]$size
+  }
+  if (total_w == 0) return(NA_real_)
+  total_sim / total_w
+}
+
+```
+
+
+
+```{R}
+## ============================================================================
+
+## PART 1: synthetic-data generator
+
+## ============================================================================
+
+mix_probs <- function(base_probs, target_probs, alpha) {  
+  (1 - alpha) * base_probs + alpha * target_probs
+} # alpha is how much leakage 
+
+generate_protected_attributes <- function(
+    n,
+    n_protected,
+    protected_levels,
+    protected_probs = NULL
+) {
+  # Expand scalar protected_levels if needed
+  if (length(protected_levels) == 1)
+    protected_levels <- rep(protected_levels, n_protected)
+  # If no probabilities are supplied, use uniform probabilities
+  if (is.null(protected_probs)) {
+    protected_probs <- lapply(protected_levels,
+                              function(L) rep(1 / L, L))
+  }
+  # Check that probabilities are supplied correctly
+  if (length(protected_probs) != n_protected)
+    stop("protected_probs must contain one probability vector for each protected variable.")
+  protected_df <- data.frame(row.names = 1:n)
+  for (m in 1:n_protected) {
+    var_name <- paste0("Protected_", m)
+    n_levels <- protected_levels[m]
+    labels <- paste0("Grp", 1:n_levels)
+    probs <- protected_probs[[m]]
+    if (length(probs) != n_levels)
+      stop(paste("Length of protected_probs[[", m,
+                 "]] must equal protected_levels[", m, "].", sep = ""))
+    if (abs(sum(probs) - 1) > 1e-8)
+      stop(paste("Probabilities for protected variable", m,
+                 "must sum to 1."))
+    protected_df[[var_name]] <-
+      sample(labels,
+             size = n,
+             replace = TRUE,
+             prob = probs)
+  }
+  protected_df
+}
+
+
+
+combine_group <- function(protected_df) do.call(paste, c(protected_df, list(sep = "|")))
+generate_categorical_covariate <- function(
+    n,
+    group,
+    n_levels,
+    unfair_strength,
+    group_targets
+) {
+  # Uniform (fair) distribution
+  base_probs <- rep(1 / n_levels, n_levels)
+  # Category labels
+  level_labels <- paste0("Lvl", 1:n_levels)
+  # Check every protected group has a target distribution
+  distinct_groups <- unique(group)
+  for (g in distinct_groups) {
+    if (is.null(group_targets[[g]]))
+      stop(paste("No target probabilities supplied for group:", g))
+    if (length(group_targets[[g]]) != n_levels)
+      stop(paste("Target probabilities for", g,
+                 "must have length", n_levels))
+    if (abs(sum(group_targets[[g]]) - 1) > 1e-8)
+      stop(paste("Probabilities for", g,
+                 "must sum to 1"))
+  }
+  values <- character(n)
+  for (g in distinct_groups) {
+    idx <- which(group == g)
+    probs <- mix_probs(
+      base_probs,
+      group_targets[[g]],
+      unfair_strength
+    )
+    values[idx] <- sample(
+      level_labels,
+      size = length(idx),
+      replace = TRUE,
+      prob = probs
+    )
+  }
+  values
+}
+
+# ============================================================================
+# MAKE LEAKAGE STRUCTURE
+# ============================================================================
+
+make_leakage_structure <- function(
+    leakage_order,
+    n_leakages,
+    strength,
+    leakage_fraction,
+    J,
+    seed = NULL) {
+
+  if (!is.null(seed)) set.seed(seed)
+
+  # ------------------------------------------------------------
+  # Basic checks
+  # ------------------------------------------------------------
+
+  if (!leakage_order %in% c(1, 2, 3))
+    stop("leakage_order must be 1, 2, or 3")
+
+  if (!strength %in% c("easy", "moderate", "hard"))
+    stop("strength must be easy, moderate, or hard")
+
+  if (leakage_fraction <= 0 || leakage_fraction > 1)
+    stop("leakage_fraction must be in (0,1]")
+
+  if (J < 1)
+    stop("J must be >= 1")
+
+  # ------------------------------------------------------------
+  # Indicator-level leakage strength
+  #
+  # These are probabilities for the binary indicator:
+  # P(Cat_j = 1 | leaked protected group)
+  # ------------------------------------------------------------
+
+  leakage_targets <- list(
+    easy     = c(0.90, 0.10),
+    moderate = c(0.75, 0.25),
+    hard     = c(0.60, 0.40)
+  )
+
+  leaked_target <- leakage_targets[[strength]]
+
+  # ------------------------------------------------------------
+  # Binary indicator levels
+  # ------------------------------------------------------------
+
+  indicator_levels <- 2
+
+  stopifnot(length(leaked_target) == indicator_levels)
+
+  # ------------------------------------------------------------
+  # Protected-group combinations
+  #
+  # Protected variables:
+  # P1 = 2 levels
+  # P2 = 3 levels
+  # P3 = 3 levels
+  #
+  # Therefore:
+  # order 1 -> individual P1 groups
+  # order 2 -> P1 x P2 combinations
+  # order 3 -> P1 x P2 x P3 combinations
+  # ------------------------------------------------------------
+
+  protected_grid <- expand.grid(
+    Protected_1 = paste0("Grp", 1:2),
+    Protected_2 = paste0("Grp", 1:3),
+    Protected_3 = paste0("Grp", 1:3),
+    stringsAsFactors = FALSE
+  )
+
+  # ------------------------------------------------------------
+  # Select which protected groups will have leakage
+  # ------------------------------------------------------------
+
+  if (leakage_order == 1) {
+
+    possible <- unique(protected_grid$Protected_1)
+
+    if (n_leakages > length(possible)) {
+      stop(
+        "For leakage_order = 1, maximum n_leakages is ",
+        length(possible)
+      )
+    }
+
+    selected <- sample(
+      possible,
+      n_leakages,
+      replace = FALSE
+    )
+
+    leaked_groups <- selected
+
+    group_key <- function(x) {
+      x$Protected_1
+    }
+
+  } else if (leakage_order == 2) {
+
+    possible <- unique(
+      paste(
+        protected_grid$Protected_1,
+        protected_grid$Protected_2,
+        sep = "|"
+      )
+    )
+
+    if (n_leakages > length(possible)) {
+      stop(
+        "For leakage_order = 2, maximum n_leakages is ",
+        length(possible)
+      )
+    }
+
+    selected <- sample(
+      possible,
+      n_leakages,
+      replace = FALSE
+    )
+
+    leaked_groups <- selected
+
+    group_key <- function(x) {
+      paste(
+        x$Protected_1,
+        x$Protected_2,
+        sep = "|"
+      )
+    }
+
+  } else {
+
+    possible <- unique(
+      paste(
+        protected_grid$Protected_1,
+        protected_grid$Protected_2,
+        protected_grid$Protected_3,
+        sep = "|"
+      )
+    )
+
+    if (n_leakages > length(possible)) {
+      stop(
+        "For leakage_order = 3, maximum n_leakages is ",
+        length(possible)
+      )
+    }
+
+    selected <- sample(
+      possible,
+      n_leakages,
+      replace = FALSE
+    )
+
+    leaked_groups <- selected
+
+    group_key <- function(x) {
+      paste(
+        x$Protected_1,
+        x$Protected_2,
+        x$Protected_3,
+        sep = "|"
+      )
+    }
+  }
+
+  # ------------------------------------------------------------
+  # Number of indicators that actually contain leakage
+  # ------------------------------------------------------------
+
+  n_leaky_indicators <- ceiling(
+    J * leakage_fraction
+  )
+
+  n_leaky_indicators <- min(
+    n_leaky_indicators,
+    J
+  )
+
+  leaky_indicators <- sort(
+    sample(
+      1:J,
+      n_leaky_indicators,
+      replace = FALSE
+    )
+  )
+
+  # ------------------------------------------------------------
+  # Create target distribution for EVERY indicator
+  #
+  # Default:
+  # every protected group has P(Cat=0)=0.5,
+  #                         P(Cat=1)=0.5
+  #
+  # For selected leaked groups:
+  # replace with leakage target.
+  # ------------------------------------------------------------
+
+  group_targets <- vector(
+    "list",
+    J
+  )
+
+  for (j in 1:J) {
+
+    group_targets[[j]] <- list()
+
+    # All possible protected combinations
+    for (i in 1:nrow(protected_grid)) {
+
+      key <- group_key(
+        protected_grid[i, , drop = FALSE]
+      )
+
+      group_targets[[j]][[key]] <- c(
+        0.5,
+        0.5
+      )
+    }
+
+    # Apply leakage only to selected indicators
+    if (j %in% leaky_indicators) {
+
+      for (g in leaked_groups) {
+
+        group_targets[[j]][[g]] <- leaked_target
+      }
+    }
+  }
+
+  # ------------------------------------------------------------
+  # Actual leakage fraction
+  # ------------------------------------------------------------
+
+  leakage_fraction_actual <-
+    n_leaky_indicators / J
+
+  # ------------------------------------------------------------
+  # Return everything needed by simulate_data()
+  # ------------------------------------------------------------
+
+  list(
+    group_targets = group_targets,
+
+    leakage_order = leakage_order,
+
+    n_leakages_requested = n_leakages,
+
+    n_leakages_actual = length(leaked_groups),
+
+    leaked_groups = leaked_groups,
+
+    leakage_strength = strength,
+
+    leakage_fraction_requested = leakage_fraction,
+
+    leakage_fraction_actual = leakage_fraction_actual,
+
+    n_leaky_indicators = n_leaky_indicators,
+
+    leaky_indicators = leaky_indicators,
+
+    leakage_target = leaked_target
+  )
+}
+
+simulate_data <- function(
+    n = 200000,
+    n_categorical = 3,
+    categorical_levels = 3,
+    n_protected = 1,
+    protected_levels = 2,
+    protected_probs = NULL,
+    group_targets,
+    unfair_strength = 0.8,
+    seed = 123
+){
+  set.seed(seed)
+  ## ----------------------------
+  ## Check categorical levels
+  ## ----------------------------
+  if (!(length(categorical_levels) == 1 ||
+        length(categorical_levels) == n_categorical))
+    stop("categorical_levels must have length 1 or n_categorical")
+  if (length(categorical_levels) == 1)
+    categorical_levels <- rep(categorical_levels,
+                              n_categorical)
+  ## ----------------------------
+  ## Check protected levels
+  ## ----------------------------
+  if (!(length(protected_levels) == 1 ||
+        length(protected_levels) == n_protected))
+    stop("protected_levels must have length 1 or n_protected")
+  ## ----------------------------
+  ## Generate protected variables
+  ## ----------------------------
+  protected_df <-
+    generate_protected_attributes(
+      n,
+      n_protected,
+      protected_levels,
+      protected_probs
+    )
+  ## ----------------------------
+  ## Build intersection labels
+  ## ----------------------------
+  group <- combine_group(protected_df)
+  ## ----------------------------
+  ## Generate indicators
+  ## ----------------------------
+  covariate_list <- list()
+  for(j in 1:n_categorical){
+    covariate_list[[paste0("Cat_",j)]] <-
+      generate_categorical_covariate(
+        n = n,
+        group = group,
+        n_levels = categorical_levels[j],
+        unfair_strength = unfair_strength,
+        group_targets = group_targets[[j]]
+      )
+  }
+  ## ----------------------------
+  ## Final dataset
+  ## ----------------------------
+  cbind(
+    as.data.frame(covariate_list,
+                  stringsAsFactors = FALSE),
+    protected_df
+  )
+}
+
+```
+
+# SIMULATION 1 :
+
+```{R}
+
+
+## -------------------------------------------------------
+## Protected variable probabilities
+## -------------------------------------------------------
+
+protected_probs <- list(
+  # Protected_1
+  c(0.5, 0.5),
+  # Protected_2
+  c(0.5, 0.5)
+)
+
+## -------------------------------------------------------
+## Target distributions for every indicator
+## -------------------------------------------------------
+
+group_targets <- list(
+  ## ---------------- Cat_1 ----------------
+  list(
+    "Grp1|Grp1" = c(1/3, 1/3, 1/3),
+    "Grp1|Grp2" = c(1/3, 1/3, 1/3),
+    "Grp2|Grp1" = c(0.60, 0.25, 0.15),   # <-- Leakage
+    "Grp2|Grp2" = c(1/3, 1/3, 1/3)
+  ),
+  ## ---------------- Cat_2 ----------------
+  list(
+    "Grp1|Grp1" = c(1/3, 1/3, 1/3),
+    "Grp1|Grp2" = c(1/3, 1/3, 1/3),
+    "Grp2|Grp1" = c(0.20, 0.60, 0.20),   # <-- Leakage
+    "Grp2|Grp2" = c(1/3, 1/3, 1/3)
+  ),
+  ## ---------------- Cat_3 ----------------
+  list(
+    "Grp1|Grp1" = c(1/3, 1/3, 1/3),
+    "Grp1|Grp2" = c(1/3, 1/3, 1/3),
+    "Grp2|Grp1" = c(0.15, 0.25, 0.60),   # <-- Leakage
+    "Grp2|Grp2" = c(1/3, 1/3, 1/3)
+  )
+)
+
+
+## -------------------------------------------------------
+## Generate data
+## -------------------------------------------------------
+
+data <- simulate_data(
+  n = 200000,
+  n_categorical = 3,
+  categorical_levels = 3,
+  n_protected = 2,
+  protected_levels = c(2,2),
+  protected_probs = protected_probs,
+  group_targets = group_targets,
+  unfair_strength = 0.8,
+  seed = 123
+)
+head(data)
+```
+
+```{R}
+cluster_vars <- c(
+    "Cat_1",
+    "Cat_2",
+    "Cat_3"
+)
+protected_vars <- c(
+    "Protected_1",
+    "Protected_2"
+)
+
+k <- 4
+
+mc_fit <- fit_multicluster(
+    data = data,
+    cluster_vars = cluster_vars,
+    k = 4
+)
+
+tv_fit <- fit_tv_cluster(
+    data = data,
+    cluster_vars = cluster_vars,
+    protected_vars = protected_vars,
+    k = 4,
+    lambda = 1
+)
+
+ca_fit <- fit_ca_cluster(
+    data = data,
+    cluster_vars = cluster_vars,
+    protected_vars = protected_vars,
+    k = 4,
+    lambda_tv = 1,
+    lambda_ca = 1
+)
+
+```
+
+
+```{r}
+data
+data$Cluster_CA <- factor(ca_fit$assignment_obs)
+data$Cluster_TV <- factor(tv_fit$assignment_obs)
+data$Cluster_MC <- factor(mc_fit$assignment_obs)
+
+```
+
+```{r}
+library(FactoMineR)
+library(factoextra)
+
+mca <- MCA(data[,cluster_vars], graph = FALSE)
+```
+
+```{R}
+fviz_mca_ind(
+    mca,
+    habillage = data$Cluster_CA,
+    addEllipses = TRUE
+)
+
+```
+
+
+
+```{r}
+fviz_mca_ind(
+    mca,
+    habillage = data$Cluster_TV,
+    addEllipses = TRUE
+)
+```
+
+
+```{r}
+fviz_mca_ind(
+    mca,
+    habillage = data$Cluster_MC,
+    addEllipses = TRUE
+)
+```
+
+
+```{R}
+# library(uwot)
+# X <- model.matrix(~.-1,data[,cluster_vars])
+# embedding <- umap(X)
+```
+
+```{R}
+# plot(
+# embedding,
+# col=data$Cluster_CA,
+# pch=19
+# )
+```
+
+```{R}
+# plot(
+# embedding,
+# col=data$Cluster_TV,
+# pch=19
+# )
+```
+
+```{R}
+
+
+```
+
+```{R}
+# NEEDS LOT OF MEMORY DO LATER :)
+# library(cluster)
+# library(uwot)
+# X <- data[, cluster_vars]
+# 
+# X[] <- lapply(X, factor)
+# 
+# library(cluster)
+# 
+# D <- daisy(X, metric = "gower")
+# D <- daisy(data[,cluster_vars], metric="gower")
+# emb <- umap(as.matrix(D), input="dist")
+# 
+# plot(
+#     emb,
+#     col=data$Cluster_CA,
+#     pch=19
+# )
+```
+
+
+
+```{R}
+
+library(dplyr)
+library(tidyr)
+
+plot_data <- data %>%
+  select(Protected_1,
+         Cluster_MC,
+         Cluster_TV,
+         Cluster_CA) %>%
+  pivot_longer(
+    cols = starts_with("Cluster"),
+    names_to = "Method",
+    values_to = "Cluster"
+  )
+
+
+pop_prop <- data %>%
+  count(Protected_1) %>%
+  mutate(prop = n / sum(n))
+
+pop_prop
+cum_lines <- cumsum(pop_prop$prop)
+cum_lines
+ggplot(plot_data,
+       aes(x = Cluster,
+           fill = Protected_1)) +
+
+    geom_bar(position="fill") +
+
+    geom_hline(yintercept = cum_lines,
+               linetype="dashed",
+               colour="red",
+               linewidth=0.8) +
+
+    facet_wrap(~Method) +
+
+    scale_y_continuous(labels=scales::percent) +
+
+    theme_bw()
+```
+
+
+
+```{R}
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+## =====================================================
+## Create joint protected group
+## =====================================================
+
+data$JointProtected <-
+  interaction(data$Protected_1,
+              data$Protected_2,
+              sep = " × ")
+
+## =====================================================
+## Function to make one fairness plot
+## =====================================================
+
+plot_fairness <- function(data, cluster_col, protected_col, title){
+
+  # Overall population proportions
+  pop_prop <- prop.table(table(data[[protected_col]]))
+
+  # Cumulative proportions
+  cum_lines <- cumsum(pop_prop)
+  cum_lines <- cum_lines[-length(cum_lines)]
+
+  ggplot(data,
+         aes(x = .data[[cluster_col]],
+             fill = .data[[protected_col]])) +
+
+    geom_bar(position = "fill",
+             colour = "black") +
+
+    geom_hline(
+      yintercept = cum_lines,
+      linetype = "dashed",
+      colour = "red",
+      linewidth = 0.8
+    ) +
+
+    scale_y_continuous(
+      labels = percent_format()
+    ) +
+
+    labs(
+      title = title,
+      x = "Cluster",
+      y = "Proportion",
+      fill = protected_col
+    ) +
+
+    theme_bw() +
+
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      legend.position = "right"
+    )
+}
+
+## =====================================================
+## ORIGINAL MULTICLUSTER
+## =====================================================
+
+plot_fairness(
+  data,
+  "Cluster_MC",
+  "Protected_1",
+  "MC : Protected Variable 1"
+)
+
+plot_fairness(
+  data,
+  "Cluster_MC",
+  "Protected_2",
+  "MC : Protected Variable 2"
+)
+
+plot_fairness(
+  data,
+  "Cluster_MC",
+  "JointProtected",
+  "MC : Joint Protected Groups"
+)
+
+## =====================================================
+## TV METHOD
+## =====================================================
+
+plot_fairness(
+  data,
+  "Cluster_TV",
+  "Protected_1",
+  "TV : Protected Variable 1"
+)
+
+plot_fairness(
+  data,
+  "Cluster_TV",
+  "Protected_2",
+  "TV : Protected Variable 2"
+)
+
+plot_fairness(
+  data,
+  "Cluster_TV",
+  "JointProtected",
+  "TV : Joint Protected Groups"
+)
+
+## =====================================================
+## CA METHOD
+## =====================================================
+
+plot_fairness(
+  data,
+  "Cluster_CA",
+  "Protected_1",
+  "CA : Protected Variable 1"
+)
+
+plot_fairness(
+  data,
+  "Cluster_CA",
+  "Protected_2",
+  "CA : Protected Variable 2"
+)
+
+plot_fairness(
+  data,
+  "Cluster_CA",
+  "JointProtected",
+  "CA : Joint Protected Groups"
+)
+```
+
+
+
+
+# SIMULATION 2 :
+
+```{R}
+
+## -------------------------------------------------------
+## Protected variable probabilities
+## -------------------------------------------------------
+
+protected_probs <- list(
+  # Protected_1
+  c(0.2, 0.8),
+  # Protected_2
+  c(0.5, 0.5)
+)
+
+## -------------------------------------------------------
+## Target distributions for every indicator
+## -------------------------------------------------------
+
+group_targets <- list(
+  ## ---------------- Cat_1 ----------------
+  list(
+    "Grp1|Grp1" = c(1/3, 1/3, 1/3),
+    "Grp1|Grp2" = c(1/3, 1/3, 1/3),
+    "Grp2|Grp1" = c(0.60, 0.25, 0.15),   # <-- Leakage
+    "Grp2|Grp2" = c(1/3, 1/3, 1/3)
+  ),
+  ## ---------------- Cat_2 ----------------
+  list(
+    "Grp1|Grp1" = c(1/3, 1/3, 1/3),
+    "Grp1|Grp2" = c(1/3, 1/3, 1/3),
+    "Grp2|Grp1" = c(0.20, 0.60, 0.20),   # <-- Leakage
+    "Grp2|Grp2" = c(1/3, 1/3, 1/3)
+  ),
+  ## ---------------- Cat_3 ----------------
+  list(
+    "Grp1|Grp1" = c(1/3, 1/3, 1/3),
+    "Grp1|Grp2" = c(1/3, 1/3, 1/3),
+    "Grp2|Grp1" = c(0.15, 0.25, 0.60),   # <-- Leakage
+    "Grp2|Grp2" = c(1/3, 1/3, 1/3)
+  )
+)
+
+
+## -------------------------------------------------------
+## Generate data
+## -------------------------------------------------------
+
+data <- simulate_data(
+  n = 200000,
+  n_categorical = 3,
+  categorical_levels = 3,
+  n_protected = 2,
+  protected_levels = c(2,2),
+  protected_probs = protected_probs,
+  group_targets = group_targets,
+  unfair_strength = 0.8,
+  seed = 123
+)
+head(data)
+```
+
+```{R}
+cluster_vars <- c(
+    "Cat_1",
+    "Cat_2",
+    "Cat_3"
+)
+protected_vars <- c(
+    "Protected_1",
+    "Protected_2"
+)
+
+k <- 4
+
+mc_fit <- fit_multicluster(
+    data = data,
+    cluster_vars = cluster_vars,
+    k = 4
+)
+
+tv_fit <- fit_tv_cluster(
+    data = data,
+    cluster_vars = cluster_vars,
+    protected_vars = protected_vars,
+    k = 4,
+    lambda = 1
+)
+
+ca_fit <- fit_ca_cluster(
+    data = data,
+    cluster_vars = cluster_vars,
+    protected_vars = protected_vars,
+    k = 4,
+    lambda_tv = 1,
+    lambda_ca = 1
+)
+
+```
+
+
+```{r}
+data
+data$Cluster_CA <- factor(ca_fit$assignment_obs)
+data$Cluster_TV <- factor(tv_fit$assignment_obs)
+data$Cluster_MC <- factor(mc_fit$assignment_obs)
+
+```
+
+```{r}
+library(FactoMineR)
+library(factoextra)
+
+mca <- MCA(data[,cluster_vars], graph = FALSE)
+```
+
+```{R}
+fviz_mca_ind(
+    mca,
+    habillage = data$Cluster_CA,
+    addEllipses = TRUE
+)
+
+```
+
+
+
+```{r}
+fviz_mca_ind(
+    mca,
+    habillage = data$Cluster_TV,
+    addEllipses = TRUE
+)
+```
+
+
+```{r}
+fviz_mca_ind(
+    mca,
+    habillage = data$Cluster_MC,
+    addEllipses = TRUE
+)
+```
+
+
+```{R}
+library(uwot)
+X <- model.matrix(~.-1,data[,cluster_vars])
+embedding <- umap(X)
+```
+
+```{R}
+plot(
+embedding,
+col=data$Cluster_CA,
+pch=19
+)
+```
+
+```{R}
+plot(
+embedding,
+col=data$Cluster_TV,
+pch=19
+)
+```
+
+```{R}
+plot(
+embedding,
+col=data$Cluster_MC,
+pch=19
+)
+```
+
+```{R}
+# NEEDS LOT OF MEMORY DO LATER :)
+# library(cluster)
+# library(uwot)
+# X <- data[, cluster_vars]
+# 
+# X[] <- lapply(X, factor)
+# 
+# library(cluster)
+# 
+# D <- daisy(X, metric = "gower")
+# D <- daisy(data[,cluster_vars], metric="gower")
+# emb <- umap(as.matrix(D), input="dist")
+# 
+# plot(
+#     emb,
+#     col=data$Cluster_CA,
+#     pch=19
+# )
+```
+
+
+
+
+
+```{R}
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+## =====================================================
+## Create joint protected group
+## =====================================================
+
+data$JointProtected <-
+  interaction(data$Protected_1,
+              data$Protected_2,
+              sep = " × ")
+
+## =====================================================
+## Function to make one fairness plot
+## =====================================================
+
+plot_fairness <- function(data, cluster_col, protected_col, title) {
+
+  pop_prop <- prop.table(
+    table(data[[protected_col]])
+  )
+
+  levels_order <- names(pop_prop)
+
+  plot_data <- data
+
+  plot_data[[protected_col]] <- factor(
+    plot_data[[protected_col]],
+    levels = levels_order
+  )
+
+  # With reverse = TRUE, stack bottom -> top follows
+  # levels_order.
+  stack_prop <- pop_prop
+
+  cum_lines <- cumsum(stack_prop)
+  cum_lines <- cum_lines[-length(cum_lines)]
+
+  ggplot2::ggplot(
+    plot_data,
+    ggplot2::aes(
+      x = .data[[cluster_col]],
+      fill = .data[[protected_col]]
+    )
+  ) +
+
+    ggplot2::geom_bar(
+      position = ggplot2::position_fill(reverse = TRUE),
+      colour = "black"
+    ) +
+
+    ggplot2::geom_hline(
+      yintercept = cum_lines,
+      linetype = "dashed",
+      colour = "red",
+      linewidth = 0.8
+    ) +
+
+    ggplot2::scale_y_continuous(
+      labels = scales::percent_format()
+    ) +
+
+    ggplot2::labs(
+      title = title,
+      x = "Cluster",
+      y = "Proportion",
+      fill = protected_col
+    ) +
+
+    ggplot2::theme_bw() +
+
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(hjust = 0.5),
+      legend.position = "right"
+    )
+}
+## =====================================================
+## ORIGINAL MULTICLUSTER
+## =====================================================
+
+plot_fairness(
+  data,
+  "Cluster_MC",
+  "Protected_1",
+  "MC : Protected Variable 1"
+)
+
+plot_fairness(
+  data,
+  "Cluster_MC",
+  "Protected_2",
+  "MC : Protected Variable 2"
+)
+
+plot_fairness(
+  data,
+  "Cluster_MC",
+  "JointProtected",
+  "MC : Joint Protected Groups"
+)
+
+## =====================================================
+## TV METHOD
+## =====================================================
+
+plot_fairness(
+  data,
+  "Cluster_TV",
+  "Protected_1",
+  "TV : Protected Variable 1"
+)
+
+plot_fairness(
+  data,
+  "Cluster_TV",
+  "Protected_2",
+  "TV : Protected Variable 2"
+)
+
+plot_fairness(
+  data,
+  "Cluster_TV",
+  "JointProtected",
+  "TV : Joint Protected Groups"
+)
+
+## =====================================================
+## CA METHOD
+## =====================================================
+
+plot_fairness(
+  data,
+  "Cluster_CA",
+  "Protected_1",
+  "CA : Protected Variable 1"
+)
+
+plot_fairness(
+  data,
+  "Cluster_CA",
+  "Protected_2",
+  "CA : Protected Variable 2"
+)
+
+plot_fairness(
+  data,
+  "Cluster_CA",
+  "JointProtected",
+  "CA : Joint Protected Groups"
+)
+```
+
+
+
+
+
+

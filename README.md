@@ -34,9 +34,8 @@ Similarity (cluster quality) stays ≈ 0.73–0.74 throughout. Plots in `results
 - Local search; no global-optimality guarantee.
 - λ behaves in steps because the similarity score is coarse; always sweep λ.
 - Joint table grows multiplicatively with protected attributes, so it gets sparse.
-- Evidence so far is simulation only. [Update once real-data section is done.]
-- The Multicluster baseline is a simple greedy proxy, not a replication of the
-  original algorithm (full pseudocode wasn't available).
+- Evidence so far is simulation only.
+- The Multicluster baseline is a simple greedy proxy
 
 ## Run it
 ```r
